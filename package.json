@@ -4,6 +4,14 @@
   "description": "Lightweight Pi extension that displays model quota, balance, and reset time in the footer.",
   "type": "module",
   "license": "MIT",
+  "homepage": "https://github.com/13075061852/pi-model-quota#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/13075061852/pi-model-quota.git"
+  },
+  "bugs": {
+    "url": "https://github.com/13075061852/pi-model-quota/issues"
+  },
   "keywords": [
     "pi-package",
     "pi-extension",

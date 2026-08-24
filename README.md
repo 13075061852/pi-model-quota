@@ -5,7 +5,7 @@
 ## 从 GitHub 一行安装
 
 ```bash
-pi install git:github.com/<GitHub用户名>/pi-model-quota
+pi install git:github.com/13075061852/pi-model-quota
 ```
 
 安装后重新启动 Pi；如果从正在运行的 Pi 内安装，也可以执行 `/reload`。
@@ -13,8 +13,8 @@ pi install git:github.com/<GitHub用户名>/pi-model-quota
 更新或卸载：
 
 ```bash
-pi update git:github.com/<GitHub用户名>/pi-model-quota
-pi remove git:github.com/<GitHub用户名>/pi-model-quota
+pi update git:github.com/13075061852/pi-model-quota
+pi remove git:github.com/13075061852/pi-model-quota
 ```
 
 > 本项目以 **Pi Package** 发布：Extension 负责页脚、事件监听和额度查询；`skills/model-quota/SKILL.md` 仅提供 `/skill:model-quota` 使用及排障说明。单独的 Skill 无法实现常驻页脚。
