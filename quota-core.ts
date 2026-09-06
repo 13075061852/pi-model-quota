@@ -23,6 +23,7 @@ export interface QuotaObservation {
 	windows: QuotaWindow[];
 	plan?: string;
 	note?: string;
+	resetCredits?: number;
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -128,7 +129,7 @@ function makePercentWindow(
 	};
 }
 
-function parseCodexPayload(data: unknown, now: number): { windows: QuotaWindow[]; plan?: string; note?: string } {
+function parseCodexPayload(data: unknown, now: number): Pick<QuotaObservation, "windows" | "plan" | "note" | "resetCredits"> {
 	const root = record(data) ?? {};
 	const rateLimit = record(root.rate_limit) ?? record(root.rate_limits) ?? {};
 	const windows: QuotaWindow[] = [];
@@ -181,12 +182,14 @@ function parseCodexPayload(data: unknown, now: number): { windows: QuotaWindow[]
 	const spend = record(root.spend_control);
 	const spendReached = spend?.reached === true;
 	const plan = typeof root.plan_type === "string" ? root.plan_type : undefined;
-	const resetCredits = finite(record(root.rate_limit_reset_credits)?.available_count);
+	const availableCount = finite(record(root.rate_limit_reset_credits)?.available_count);
+	const resetCredits = availableCount !== undefined && Number.isInteger(availableCount) && availableCount >= 0
+		? availableCount : undefined;
 	const notes = [
 		spendReached ? "消费上限已触发" : undefined,
 		resetCredits !== undefined && resetCredits > 0 ? `${resetCredits} 次重置券` : undefined,
 	].filter(Boolean);
-	return { windows, plan, note: notes.length ? notes.join(" · ") : undefined };
+	return { windows, plan, note: notes.length ? notes.join(" · ") : undefined, resetCredits };
 }
 
 function parseAnthropicPayload(data: unknown, now: number): { windows: QuotaWindow[]; note?: string } {
@@ -376,7 +379,7 @@ function parseZaiPayload(data: unknown, now: number): { windows: QuotaWindow[]; 
 	return { windows, plan: typeof body.level === "string" ? body.level : undefined };
 }
 
-export function parseAccountPayload(provider: string, data: unknown, now = Date.now()): Pick<QuotaObservation, "windows" | "plan" | "note"> {
+export function parseAccountPayload(provider: string, data: unknown, now = Date.now()): Pick<QuotaObservation, "windows" | "plan" | "note" | "resetCredits"> {
 	if (provider === "openai-codex") return parseCodexPayload(data, now);
 	if (provider === "anthropic") return parseAnthropicPayload(data, now);
 	if (provider === "openrouter") return parseOpenRouterPayload(data);
@@ -536,6 +539,7 @@ export function mergeObservations(account: QuotaObservation | undefined, headers
 		...newer,
 		// Account APIs carry plan metadata even when response headers are newer.
 		plan: account.plan ?? newer.plan,
+		resetCredits: account.resetCredits,
 		checkedAt: newer.checkedAt,
 		windows: [...merged.values()],
 		note: [account.note, headers.note].filter(Boolean).join(" · ") || undefined,
@@ -572,20 +576,28 @@ export function nextResetAt(observation: QuotaObservation, now = Date.now()): nu
 
 export function formatCompact(observation: QuotaObservation, now = Date.now()): string {
 	const mode = authModeLabel(observation.authMode);
+	const creditsSuffix = observation.provider === "openai-codex" && observation.resetCredits !== undefined
+		? ` · 重置卡 ${observation.resetCredits}次` : "";
 	const resetAt = observation.authMode === "subscription" ? nextResetAt(observation, now) : undefined;
 	const resetSuffix = resetAt === undefined ? "" : ` · ↻ ${compactResetDate(resetAt)}`;
 	const percentWindows = observation.windows.filter((window) => remainingPercent(window) !== undefined).slice(0, 2);
 	if (percentWindows.length > 0) {
-		return `额度[${mode}] ${percentWindows.map((window) => `${window.label} ${Math.round(remainingPercent(window)!)}%`).join(" · ")}${resetSuffix}`;
+		return `额度[${mode}] ${percentWindows.map((window) => {
+			const reset = observation.authMode === "subscription" && window.resetAt !== undefined && window.resetAt * 1000 > now
+				? ` ↻ ${compactResetDate(window.resetAt)}`
+				: "";
+			return `${window.label} ${Math.round(remainingPercent(window)!)}%${reset}`;
+		}).join(" · ")}${creditsSuffix}`;
 	}
 	const balances = observation.windows.filter((window) => window.remaining !== undefined).slice(0, 2);
 	if (balances.length > 0) {
 		return `额度[${mode}] ${balances.map((window) => {
 			const prefix = window.unit === "currency" ? currencySymbol(window.currency) : "";
-			return `${window.label} ${prefix}${compactNumber(window.remaining!)}${window.limit !== undefined ? `/${prefix}${compactNumber(window.limit)}` : ""}`;
-		}).join(" · ")}${resetSuffix}`;
+			const label = window.unit === "currency" ? "" : `${window.label} `;
+			return `${label}${prefix}${compactNumber(window.remaining!)}${window.limit !== undefined ? `/${prefix}${compactNumber(window.limit)}` : ""}`;
+		}).join(" · ")}${resetSuffix}${creditsSuffix}`;
 	}
-	return `额度[${mode}] 上游未公开`;
+	return `额度[${mode}] 上游未公开${creditsSuffix}`;
 }
 
 export function lowestRemainingPercent(observation: QuotaObservation): number | undefined {

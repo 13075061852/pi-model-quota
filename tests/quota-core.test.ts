@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	formatCompact,
+	formatDetails,
 	lowestRemainingPercent,
 	mergeObservations,
 	nextResetAt,
@@ -39,7 +40,7 @@ test("parses Codex subscription windows and credits", () => {
 	assert.equal(parsed.windows[2]?.remaining, 12.5);
 });
 
-test("shows the nearest reset date for subscription quota", () => {
+test("shows separate five-hour and weekly reset dates for subscription quota", () => {
 	const earliest = NOW / 1000 + 600;
 	const observation: QuotaObservation = {
 		provider: "openai-codex",
@@ -56,7 +57,22 @@ test("shows the nearest reset date for subscription quota", () => {
 	const pad = (value: number) => String(value).padStart(2, "0");
 	const expected = `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 	assert.equal(nextResetAt(observation, NOW), earliest);
-	assert.equal(formatCompact(observation, NOW), `额度[订阅] 5h 80% · 7d 60% · ↻ ${expected}`);
+	const weeklyDate = new Date((NOW / 1000 + 3600) * 1000);
+	const weeklyExpected = `${pad(weeklyDate.getMonth() + 1)}-${pad(weeklyDate.getDate())} ${pad(weeklyDate.getHours())}:${pad(weeklyDate.getMinutes())}`;
+	assert.equal(formatCompact(observation, NOW), `额度[订阅] 5h 80% ↻ ${expected} · 7d 60% ↻ ${weeklyExpected}`);
+
+	// A missing or expired reset must not inherit another window's timestamp.
+	observation.windows[0]!.resetAt = undefined;
+	assert.equal(formatCompact(observation, NOW), `额度[订阅] 5h 80% · 7d 60% ↻ ${weeklyExpected}`);
+	observation.windows[0]!.resetAt = NOW / 1000;
+	assert.equal(formatCompact(observation, NOW), `额度[订阅] 5h 80% · 7d 60% ↻ ${weeklyExpected}`);
+	observation.windows[1]!.resetAt = NOW / 1000 - 1;
+	assert.equal(formatCompact(observation, NOW), "额度[订阅] 5h 80% · 7d 60%");
+
+	// Non-subscription footer formatting remains unchanged.
+	observation.windows[0]!.resetAt = earliest;
+	observation.authMode = "api_key";
+	assert.equal(formatCompact(observation, NOW), "额度[Key] 5h 80% · 7d 60%");
 });
 
 test("parses OpenAI-compatible request and token headers", () => {
@@ -123,6 +139,27 @@ test("parses DeepSeek account balance", () => {
 	assert.equal(parsed.note, "充值 18.31CNY");
 });
 
+test("omits redundant currency labels only in the compact balance display", () => {
+	const observation: QuotaObservation = {
+		provider: "deepseek",
+		modelId: "deepseek-chat",
+		authMode: "api_key",
+		source: "account_api",
+		checkedAt: NOW,
+		...parseAccountPayload("deepseek", {
+			is_available: true,
+			balance_infos: [{ currency: "CNY", total_balance: "108.42" }],
+		}, NOW),
+	};
+	assert.equal(formatCompact(observation, NOW), "额度[Key] ¥108.42");
+	assert.match(formatDetails(observation, NOW), /余额\(CNY\)：剩余 ¥108\.42/);
+
+	observation.windows.push({ id: "usd", label: "余额(USD)", unit: "currency", currency: "USD", remaining: 12.5 });
+	assert.equal(formatCompact(observation, NOW), "额度[Key] ¥108.42 · $12.5");
+	observation.windows = [{ id: "requests", label: "请求", unit: "requests", remaining: 10 }];
+	assert.equal(formatCompact(observation, NOW), "额度[Key] 请求 10");
+});
+
 test("formats the lowest remaining quota in compact status", () => {
 	const observation: QuotaObservation = {
 		provider: "openai-codex",
@@ -172,6 +209,36 @@ test("parses a Codex secondary-only header family", () => {
 	assert.equal(windows.length, 1);
 	assert.equal(windows[0]?.label, "7d");
 	assert.equal(windows[0]?.usedPercent, 35);
+});
+
+test("shows Codex reset cards and preserves them when newer headers arrive", () => {
+	const payload = {
+		rate_limit: { primary_window: { used_percent: 20 } },
+		rate_limit_reset_credits: { available_count: 2 },
+	};
+	const account: QuotaObservation = {
+		provider: "openai-codex", modelId: "gpt-test", authMode: "subscription",
+		source: "account_api", checkedAt: NOW,
+		...parseAccountPayload("openai-codex", payload, NOW),
+	};
+	assert.equal(account.resetCredits, 2);
+	assert.equal(formatCompact(account, NOW), "额度[订阅] 5h 80% · 重置卡 2次");
+	const headers: QuotaObservation = {
+		provider: account.provider, modelId: account.modelId, authMode: account.authMode,
+		source: "response_headers", checkedAt: NOW + 1000,
+		windows: [{ id: "5h", label: "5h", unit: "percent", usedPercent: 30 }],
+	};
+	assert.equal(formatCompact(mergeObservations(account, headers)!, NOW), "额度[订阅] 5h 70% · 重置卡 2次");
+	payload.rate_limit_reset_credits.available_count = 0;
+	const empty = { ...account, ...parseAccountPayload("openai-codex", payload, NOW) };
+	assert.equal(formatCompact(mergeObservations(empty, headers)!, NOW), "额度[订阅] 5h 70% · 重置卡 0次");
+	for (const count of [undefined, null, -1, 1.5, "invalid"]) {
+		const parsed = parseAccountPayload("openai-codex", {
+			...payload, rate_limit_reset_credits: { available_count: count },
+		}, NOW);
+		assert.equal(parsed.resetCredits, undefined);
+		assert.equal(formatCompact({ ...account, ...parsed }, NOW), "额度[订阅] 5h 80%");
+	}
 });
 
 test("turns bare HTTP 429 into a limited window", () => {

@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { randomUUID } from "node:crypto";
 import * as http from "node:http";
 import type { AuthMode, QuotaObservation } from "./quota-core.ts";
 import { parseAccountPayload } from "./quota-core.ts";
@@ -180,7 +181,7 @@ async function readTextLimited(response: Response): Promise<string> {
 	}
 }
 
-async function fetchJson(definition: ProbeDefinition, token: string, signal?: AbortSignal): Promise<unknown> {
+async function fetchJson(definition: ProbeDefinition, token: string, signal?: AbortSignal, body?: string): Promise<unknown> {
 	const timeout = AbortSignal.timeout(PROBE_TIMEOUT_MS);
 	const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
 	const hasProxy = Boolean(process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy);
@@ -190,8 +191,9 @@ async function fetchJson(definition: ProbeDefinition, token: string, signal?: Ab
 	const restoreProxy = hasProxy && setter ? setter(process.env) : () => {};
 	try {
 		const response = await fetch(definition.url, {
-			method: "GET",
-			headers: definition.makeHeaders(token),
+			method: body === undefined ? "GET" : "POST",
+			headers: { ...definition.makeHeaders(token), ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
+			body,
 			redirect: "error",
 			signal: combined,
 		});
@@ -214,6 +216,39 @@ async function fetchJson(definition: ProbeDefinition, token: string, signal?: Ab
 	} finally {
 		restoreProxy();
 	}
+}
+
+// Preparation is read-only. The returned action is invoked ONLY after user confirmation.
+export async function prepareCodexReset(ctx: ProbeContext, authMode: AuthMode) {
+	if (ctx.model?.provider !== "openai-codex" || !["subscription", "oauth"].includes(authMode)) {
+		throw new Error("仅支持 OpenAI Codex OAuth/订阅重置卡");
+	}
+	const auth = await ctx.modelRegistry.getProviderAuth("openai-codex");
+	const token = bearerFromAuth(auth);
+	const definition = token ? definitionFor("openai-codex", token) : undefined;
+	if (!token || !definition || effectiveOrigin(ctx, auth) !== definition.allowedOrigin) {
+		throw new Error("无法确认官方认证来源，已禁止使用重置卡");
+	}
+	let invoked = false;
+	return async (signal: AbortSignal, onDispatch: () => void): Promise<boolean> => {
+		if (invoked) throw new Error("同一重置操作不能重复提交");
+		invoked = true;
+		const current = await ctx.modelRegistry.getProviderAuth("openai-codex");
+		signal.throwIfAborted();
+		if (ctx.model?.provider !== "openai-codex" || bearerFromAuth(current) !== token || effectiveOrigin(ctx, current) !== definition.allowedOrigin) {
+			throw new Error("认证或模型已变化，请重新确认");
+		}
+		onDispatch();
+		// Never retry this mutation, even on timeout. No raw server errors are surfaced.
+		try {
+			const data = await fetchJson({ ...definition, url: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume" }, token, signal,
+				JSON.stringify({ redeem_request_id: randomUUID() }));
+			const result = data as { code?: unknown; windows_reset?: unknown } | null;
+			return result?.code === "reset" && typeof result.windows_reset === "number" && Number.isInteger(result.windows_reset) && result.windows_reset > 0;
+		} catch {
+			return false;
+		}
+	};
 }
 
 export async function probeAccountQuota(
@@ -249,6 +284,7 @@ export async function probeAccountQuota(
 				windows: parsed.windows,
 				plan: parsed.plan,
 				note: parsed.note,
+				resetCredits: parsed.resetCredits,
 			},
 		};
 	} catch (error) {

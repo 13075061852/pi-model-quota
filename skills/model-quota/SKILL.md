@@ -15,6 +15,7 @@ This skill documents the companion extension in this package. The extension—no
 - `/quota` — show detailed quota, authentication mode, source, and reset times.
 - `/quota refresh` — immediately refresh the current provider's account quota.
 - `/quota debug` — show sanitized diagnostics without credentials or raw response headers.
+- `/quota reset` — user-only confirmed consumption of one existing OpenAI Codex reset card while idle. Never invoke it on the user's behalf or test with real credits. No purchases or automatic retries. After success, refresh authoritative quota and animate percentages for about one second. If the outcome is uncertain, verify official Usage before any retry/reload; if consumption succeeded but refresh failed, use `/quota refresh`, NOT another reset.
 
 ## Troubleshooting
 
@@ -26,6 +27,6 @@ This skill documents the companion extension in this package. The extension—no
 
 ## Display semantics
 
-- Subscription quotas show the nearest future reset time when the upstream returns one.
+- Subscription quotas show each displayed window's future reset time. Codex available reset-card count is also displayed when returned by the upstream.
 - API-key providers may expose account balance, request/token limits, or no quota information at all.
 - Footer colors indicate remaining quota severity; `/quota` contains the complete per-window details.

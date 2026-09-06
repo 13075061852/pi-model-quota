@@ -1,3 +1,4 @@
+import { setTimeout as delay } from "node:timers/promises";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AuthMode, QuotaObservation } from "./quota-core.ts";
 import {
@@ -8,7 +9,7 @@ import {
 	mergeObservations,
 	parseQuotaHeaders,
 } from "./quota-core.ts";
-import { probeAccountQuota, supportsAccountProbe } from "./probes.ts";
+import { prepareCodexReset, probeAccountQuota, supportsAccountProbe } from "./probes.ts";
 
 const STATUS_ID = "model-quota";
 const MIN_REFRESH_SECONDS = 30;
@@ -87,6 +88,9 @@ export default function modelQuotaExtension(pi: ExtensionAPI) {
 	let probeController: AbortController | undefined;
 	let probePromise: Promise<void> | undefined;
 	let probeSerial = 0;
+	let resetController: AbortController | undefined;
+	let resetUncertain = false;
+	let animation: QuotaObservation | undefined;
 
 	const stateFor = (key: string, ctx: ExtensionContext): QuotaState => {
 		const authMode = detectAuthMode(ctx);
@@ -114,7 +118,7 @@ export default function modelQuotaExtension(pi: ExtensionAPI) {
 			return;
 		}
 		const state = stateFor(key, ctx);
-		const observation = effectiveObservation(state);
+		const observation = animation ?? effectiveObservation(state);
 		if (observation) {
 			ctx.ui.setStatus(STATUS_ID, coloredQuotaStatus(ctx, observation));
 			return;
@@ -136,6 +140,7 @@ export default function modelQuotaExtension(pi: ExtensionAPI) {
 	};
 
 	const refreshAccount = async (ctx: ExtensionContext, force = false): Promise<void> => {
+		if (resetController) return;
 		const key = modelKey(ctx);
 		const model = ctx.model;
 		if (!key || !model) return;
@@ -188,6 +193,8 @@ export default function modelQuotaExtension(pi: ExtensionAPI) {
 	};
 
 	const activate = (ctx: ExtensionContext): void => {
+		resetController?.abort();
+		animation = undefined;
 		activeContext = ctx;
 		activeKey = modelKey(ctx);
 		probeSerial++;
@@ -221,6 +228,7 @@ export default function modelQuotaExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("after_provider_response", (event, ctx) => {
+		if (resetController && ctx.model?.provider === "openai-codex") return;
 		const key = modelKey(ctx);
 		const model = ctx.model;
 		if (!key || !model) return;
@@ -254,6 +262,8 @@ export default function modelQuotaExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
+		resetController?.abort();
+		animation = undefined;
 		generation++;
 		probeSerial++;
 		probeController?.abort();
@@ -266,8 +276,86 @@ export default function modelQuotaExtension(pi: ExtensionAPI) {
 		activeKey = undefined;
 	});
 
+	const useResetCard = async (ctx: ExtensionContext): Promise<void> => {
+		if (!ctx.hasUI) return;
+		if (resetController || resetUncertain) {
+			ctx.ui.notify(resetUncertain ? "上次重置结果不确定，已禁止本次加载期间再次使用。请先到官方 Usage 页面核实，勿盲目重试或重载。" : "重置操作正在进行，请勿重复提交。", "warning");
+			return;
+		}
+		if (!ctx.isIdle()) {
+			ctx.ui.notify("请等待模型请求结束后再使用重置卡。", "warning");
+			return;
+		}
+		const controller = new AbortController();
+		resetController = controller;
+		const key = modelKey(ctx)!;
+		const current = () => !controller.signal.aborted && modelKey(ctx) === key && activeKey === key;
+		let dispatched = false;
+		let succeeded = false;
+		try {
+			const mode = detectAuthMode(ctx);
+			// Keep only in memory; never log or persist resolved credentials.
+			const authSnapshot = JSON.stringify(await ctx.modelRegistry.getProviderAuth("openai-codex"));
+			const sameAuth = async () => JSON.stringify(await ctx.modelRegistry.getProviderAuth("openai-codex")) === authSnapshot;
+			const consume = await prepareCodexReset(ctx, mode);
+			if (!current()) return;
+			const confirmed = await ctx.ui.confirm("使用 1 张 OpenAI 额度重置卡？", "将消耗当前账户的一张重置卡（不是购买）。此操作不可撤销；额度及下次重置时间以官方返回为准。", { signal: controller.signal });
+			if (!confirmed || !current()) return;
+			if (!ctx.isIdle() || detectAuthMode(ctx) !== mode || !(await sameAuth())) throw new Error("模型请求或认证状态已变化，请稍后重新操作");
+			probeSerial++;
+			probeController?.abort();
+			if (probePromise) await probePromise;
+			probePromise = undefined;
+			if (!current()) return;
+			const before = effectiveObservation(stateFor(key, ctx));
+			ctx.ui.notify("正在使用重置卡，请勿重复操作…", "info");
+			succeeded = await consume(controller.signal, () => { dispatched = true; resetUncertain = true; });
+			// Invalidate all account-shared model caches, including on uncertain outcomes.
+			if (dispatched) for (const savedKey of states.keys()) {
+				if (savedKey.startsWith("openai-codex/")) states.delete(savedKey);
+			}
+			if (succeeded) resetUncertain = false;
+			if (!current()) return;
+			if (!succeeded) {
+				ctx.ui.notify("未能确认重置结果，可能已消耗卡。不会自动重试；请先到官方 Usage 页面核实。", "warning");
+				return;
+			}
+			if (!(await sameAuth()) || !current()) throw new Error("认证已变化");
+			const fresh = await probeAccountQuota(ctx, "openai-codex", ctx.model!.id, mode, controller.signal);
+			if (!current()) return;
+			if (!(await sameAuth())) throw new Error("认证已变化");
+			if (!fresh.observation) {
+				ctx.ui.notify("重置已成功，但额度刷新失败。请运行 /quota refresh，不要再次使用重置卡。", "warning");
+				return;
+			}
+			const state = stateFor(key, ctx);
+			state.account = fresh.observation;
+			state.lastProbeAt = Date.now();
+			// Display-only easing; authoritative cached values are never interpolated.
+			for (let frame = 0; frame <= 20 && current(); frame++) {
+				const progress = 1 - (1 - frame / 20) ** 3;
+				animation = { ...fresh.observation, windows: fresh.observation.windows.map((window) => {
+					const old = before?.windows.find((item) => item.label === window.label && item.unit === window.unit);
+					return old?.usedPercent !== undefined && window.usedPercent !== undefined
+						? { ...window, usedPercent: old.usedPercent + (window.usedPercent - old.usedPercent) * progress } : window;
+				}) };
+				renderStatus(ctx);
+				if (frame < 20) await delay(50, undefined, { signal: controller.signal });
+			}
+			if (current()) ctx.ui.notify("重置成功，已更新额度与重置卡次数。", "info");
+		} catch {
+			if (current()) ctx.ui.notify(dispatched
+				? succeeded ? "重置已成功，请用 /quota refresh 核实额度，勿重复使用。" : "重置结果不确定，请到官方 Usage 核实，勿重复使用。"
+				: "操作已取消或认证/模型状态不支持，未发送重置请求。", "warning");
+		} finally {
+			animation = undefined;
+			if (resetController === controller) resetController = undefined;
+			if (activeContext) renderStatus(activeContext);
+		}
+	};
+
 	pi.registerCommand("quota", {
-		description: "显示或刷新当前模型的剩余额度（/quota [refresh|debug]）",
+		description: "额度查询、刷新或使用重置卡（/quota [refresh|debug|reset]）",
 		handler: async (args, ctx) => {
 			activeContext = ctx;
 			activeKey = modelKey(ctx);
@@ -278,6 +366,10 @@ export default function modelQuotaExtension(pi: ExtensionAPI) {
 			}
 			const state = stateFor(key, ctx);
 			const action = args.trim().toLowerCase();
+			if (action === "reset") {
+				await useResetCard(ctx);
+				return;
+			}
 			if (action === "refresh" || action === "r") {
 				if (supportsAccountProbe(ctx.model.provider, state.authMode)) {
 					await refreshAccount(ctx, true);
