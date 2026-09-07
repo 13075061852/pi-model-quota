@@ -4,6 +4,7 @@ import type { AuthMode, QuotaObservation } from "./quota-core.ts";
 import {
 	authModeLabel,
 	formatCompact,
+	formatAccountLabel,
 	formatDetails,
 	lowestRemainingPercent,
 	mergeObservations,
@@ -23,6 +24,7 @@ interface QuotaState {
 	responseSeen: boolean;
 	probeError?: string;
 	lastProbeAt?: number;
+	credentialFingerprint?: string;
 }
 
 function refreshIntervalMs(): number {
@@ -65,13 +67,15 @@ function colorRemainingValue(ctx: ExtensionContext, value: string): string {
 
 function coloredQuotaStatus(ctx: ExtensionContext, observation: QuotaObservation): string {
 	const mode = authModeLabel(observation.authMode);
-	const plain = formatCompact(observation);
+	// Style identity separately: an email can contain digits, '%' or date-like text.
+	const account = formatAccountLabel(observation);
+	const plain = formatCompact(observation, Date.now(), false);
 	const body = plain.replace(`额度[${mode}]`, "").trim();
 	const coloredBody = body.replace(
 		/((?:\d{4}-)?\d{2}-\d{2} \d{2}:\d{2}|[$¥€]\d+(?:\.\d+)?(?:\/[$¥€]?\d+(?:\.\d+)?)?|\d+(?:\.\d+)?%)/g,
 		(value) => colorRemainingValue(ctx, value),
 	);
-	return `${quotaPrefix(ctx, mode)} ${coloredBody}`;
+	return `${quotaPrefix(ctx, mode)} ${account ? `${ctx.ui.theme.fg("accent", account)} · ` : ""}${coloredBody}`;
 }
 
 function stateStatus(ctx: ExtensionContext, mode: string, message: string, kind: "normal" | "loading" | "error"): string {
@@ -171,7 +175,22 @@ export default function modelQuotaExtension(pi: ExtensionAPI) {
 		renderStatus(ctx);
 
 		probePromise = (async () => {
-			const result = await probeAccountQuota(ctx, model.provider, model.id, state.authMode, runController.signal);
+			const result = await probeAccountQuota(ctx, model.provider, model.id, state.authMode, runController.signal, (fingerprint) => {
+				if (generation !== runGeneration || probeSerial !== runSerial) return;
+				for (const [savedKey, saved] of states) {
+					if (!savedKey.startsWith(`${model.provider}/`)) continue;
+					if (saved.credentialFingerprint && saved.credentialFingerprint !== fingerprint) {
+						// Same-provider /login must not retain another account's email or quota,
+						// including when the new account's query fails.
+						saved.account = undefined;
+						saved.headers = undefined;
+						saved.responseSeen = false;
+						saved.lastProbeAt = undefined;
+					}
+					saved.credentialFingerprint = fingerprint;
+				}
+				renderStatus(ctx);
+			});
 			if (generation !== runGeneration || probeSerial !== runSerial) return;
 			const current = states.get(runKey);
 			if (!current) return;
@@ -321,7 +340,9 @@ export default function modelQuotaExtension(pi: ExtensionAPI) {
 				return;
 			}
 			if (!(await sameAuth()) || !current()) throw new Error("认证已变化");
-			const fresh = await probeAccountQuota(ctx, "openai-codex", ctx.model!.id, mode, controller.signal);
+			const fresh = await probeAccountQuota(ctx, "openai-codex", ctx.model!.id, mode, controller.signal, (fingerprint) => {
+				if (current()) stateFor(key, ctx).credentialFingerprint = fingerprint;
+			});
 			if (!current()) return;
 			if (!(await sameAuth())) throw new Error("认证已变化");
 			if (!fresh.observation) {

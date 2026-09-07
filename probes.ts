@@ -1,8 +1,8 @@
 import { Buffer } from "node:buffer";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as http from "node:http";
 import type { AuthMode, QuotaObservation } from "./quota-core.ts";
-import { parseAccountPayload } from "./quota-core.ts";
+import { accountEmail, accountPlan, parseAccountPayload } from "./quota-core.ts";
 
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const PROBE_TIMEOUT_MS = 15_000;
@@ -66,21 +66,27 @@ function bearerFromAuth(result: AuthResultLike | undefined): string | undefined 
 	return undefined;
 }
 
-function decodeCodexAccountId(token: string): string | undefined {
+export function decodeCodexAccount(token: string): { accountId?: string; email?: string; plan?: string } {
+	// Decode only for display/routing, not as proof of identity or authorization.
 	try {
-		const payload = token.split(".")[1];
-		if (!payload) return undefined;
-		const json = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as Record<string, unknown>;
-		const auth = json["https://api.openai.com/auth"] as Record<string, unknown> | undefined;
-		return typeof auth?.chatgpt_account_id === "string" ? auth.chatgpt_account_id : undefined;
+		const parts = token.split(".");
+		if (parts.length !== 3 || !parts[1] || parts[1].length > 64 * 1024) return {};
+		const json = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+		const auth = json?.["https://api.openai.com/auth"];
+		const profile = json?.["https://api.openai.com/profile"];
+		return {
+			accountId: typeof auth?.chatgpt_account_id === "string" ? auth.chatgpt_account_id : undefined,
+			email: accountEmail(profile?.email) ?? accountEmail(json?.email),
+			plan: accountPlan(auth?.chatgpt_plan_type),
+		};
 	} catch {
-		return undefined;
+		return {};
 	}
 }
 
 function definitionFor(provider: string, token: string): ProbeDefinition | undefined {
 	if (provider === "openai-codex") {
-		const accountId = decodeCodexAccountId(token);
+		const { accountId } = decodeCodexAccount(token);
 		if (!accountId) return undefined;
 		return {
 			url: "https://chatgpt.com/backend-api/wham/usage",
@@ -257,10 +263,13 @@ export async function probeAccountQuota(
 	modelId: string,
 	authMode: AuthMode,
 	signal?: AbortSignal,
+	onCredential?: (fingerprint: string) => void,
 ): Promise<ProbeResult> {
 	if (!supportsAccountProbe(provider, authMode)) return {};
 	try {
 		const auth = await ctx.modelRegistry.getProviderAuth(provider);
+		const fingerprint = createHash("sha256").update(JSON.stringify(auth ?? null)).digest("hex");
+		onCredential?.(fingerprint);
 		const token = bearerFromAuth(auth);
 		if (!token) return { error: "未解析到当前认证凭据" };
 		const definition = definitionFor(provider, token);
@@ -272,6 +281,13 @@ export async function probeAccountQuota(
 		}
 
 		const data = await fetchJson(definition, token, signal);
+		const currentAuth = await ctx.modelRegistry.getProviderAuth(provider);
+		const currentFingerprint = createHash("sha256").update(JSON.stringify(currentAuth ?? null)).digest("hex");
+		if (currentFingerprint !== fingerprint) {
+			onCredential?.(currentFingerprint);
+			return { error: "认证已变化，请刷新额度" };
+		}
+		const identity = provider === "openai-codex" ? decodeCodexAccount(token) : {};
 		const parsed = parseAccountPayload(provider, data);
 		if (parsed.windows.length === 0) return { error: "额度接口未返回可识别的额度窗口" };
 		return {
@@ -282,7 +298,8 @@ export async function probeAccountQuota(
 				source: "account_api",
 				checkedAt: Date.now(),
 				windows: parsed.windows,
-				plan: parsed.plan,
+				plan: parsed.plan ?? identity.plan,
+				email: identity.email,
 				note: parsed.note,
 				resetCredits: parsed.resetCredits,
 			},

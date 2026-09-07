@@ -22,6 +22,8 @@ export interface QuotaObservation {
 	checkedAt: number;
 	windows: QuotaWindow[];
 	plan?: string;
+	/** Display-only metadata; never persisted by this extension. */
+	email?: string;
 	note?: string;
 	resetCredits?: number;
 }
@@ -30,6 +32,24 @@ function record(value: unknown): Record<string, unknown> | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value)
 		? (value as Record<string, unknown>)
 		: undefined;
+}
+
+export function accountEmail(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const email = value.trim();
+	return email.length <= 254 && /^[^\s@\p{Cc}\p{Cf}]+@[^\s@\p{Cc}\p{Cf}]+\.[^\s@\p{Cc}\p{Cf}]+$/u.test(email)
+		? email : undefined;
+}
+
+export function accountPlan(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const plan = value.trim();
+	return /^[a-zA-Z][a-zA-Z0-9 _-]{0,39}$/.test(plan) ? plan : undefined;
+}
+
+export function formatAccountLabel(observation: QuotaObservation): string {
+	if (observation.provider !== "openai-codex" || !["subscription", "oauth"].includes(observation.authMode)) return "";
+	return [accountEmail(observation.email), accountPlan(observation.plan)?.toUpperCase()].filter(Boolean).join(" ");
 }
 
 function array(value: unknown): unknown[] {
@@ -181,7 +201,7 @@ function parseCodexPayload(data: unknown, now: number): Pick<QuotaObservation, "
 	}
 	const spend = record(root.spend_control);
 	const spendReached = spend?.reached === true;
-	const plan = typeof root.plan_type === "string" ? root.plan_type : undefined;
+	const plan = accountPlan(root.plan_type);
 	const availableCount = finite(record(root.rate_limit_reset_credits)?.available_count);
 	const resetCredits = availableCount !== undefined && Number.isInteger(availableCount) && availableCount >= 0
 		? availableCount : undefined;
@@ -539,6 +559,7 @@ export function mergeObservations(account: QuotaObservation | undefined, headers
 		...newer,
 		// Account APIs carry plan metadata even when response headers are newer.
 		plan: account.plan ?? newer.plan,
+		email: account.email,
 		resetCredits: account.resetCredits,
 		checkedAt: newer.checkedAt,
 		windows: [...merged.values()],
@@ -574,15 +595,17 @@ export function nextResetAt(observation: QuotaObservation, now = Date.now()): nu
 	return future.length ? Math.min(...future) : undefined;
 }
 
-export function formatCompact(observation: QuotaObservation, now = Date.now()): string {
+export function formatCompact(observation: QuotaObservation, now = Date.now(), showAccount = true): string {
 	const mode = authModeLabel(observation.authMode);
+	const account = showAccount ? formatAccountLabel(observation) : "";
+	const prefix = `额度[${mode}]${account ? ` ${account} ·` : ""}`;
 	const creditsSuffix = observation.provider === "openai-codex" && observation.resetCredits !== undefined
 		? ` · 重置卡 ${observation.resetCredits}次` : "";
 	const resetAt = observation.authMode === "subscription" ? nextResetAt(observation, now) : undefined;
 	const resetSuffix = resetAt === undefined ? "" : ` · ↻ ${compactResetDate(resetAt)}`;
 	const percentWindows = observation.windows.filter((window) => remainingPercent(window) !== undefined).slice(0, 2);
 	if (percentWindows.length > 0) {
-		return `额度[${mode}] ${percentWindows.map((window) => {
+		return `${prefix} ${percentWindows.map((window) => {
 			const reset = observation.authMode === "subscription" && window.resetAt !== undefined && window.resetAt * 1000 > now
 				? ` ↻ ${compactResetDate(window.resetAt)}`
 				: "";
@@ -591,13 +614,13 @@ export function formatCompact(observation: QuotaObservation, now = Date.now()): 
 	}
 	const balances = observation.windows.filter((window) => window.remaining !== undefined).slice(0, 2);
 	if (balances.length > 0) {
-		return `额度[${mode}] ${balances.map((window) => {
+		return `${prefix} ${balances.map((window) => {
 			const prefix = window.unit === "currency" ? currencySymbol(window.currency) : "";
 			const label = window.unit === "currency" ? "" : `${window.label} `;
 			return `${label}${prefix}${compactNumber(window.remaining!)}${window.limit !== undefined ? `/${prefix}${compactNumber(window.limit)}` : ""}`;
 		}).join(" · ")}${resetSuffix}${creditsSuffix}`;
 	}
-	return `额度[${mode}] 上游未公开${creditsSuffix}`;
+	return `${prefix} 上游未公开${creditsSuffix}`;
 }
 
 export function lowestRemainingPercent(observation: QuotaObservation): number | undefined {
@@ -622,6 +645,8 @@ export function formatDetails(observation: QuotaObservation, now = Date.now()): 
 		`认证：${authModeLabel(observation.authMode)}${observation.plan ? ` · ${observation.plan}` : ""}`,
 		`来源：${observation.source === "account_api" ? "账户额度接口" : "模型响应头"}`,
 	];
+	const account = formatAccountLabel(observation);
+	if (account) lines.splice(1, 0, `账户：${account}`);
 	for (const window of observation.windows) {
 		const remainingPct = remainingPercent(window);
 		const prefix = window.unit === "currency" ? currencySymbol(window.currency) : "";

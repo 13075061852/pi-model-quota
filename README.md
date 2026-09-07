@@ -9,7 +9,7 @@
 A lightweight Pi extension for model quota, balance, reset times, and confirmed Codex reset-card redemption. No third-party runtime dependencies.
 
 ```text
-◆ 额度[订阅] 5h 82% ↻ 09-06 14:30 · 7d 47% ↻ 09-10 09:00 · 重置卡 2次
+◆ 额度[订阅] demo@example.com PLUS · 5h 82% ↻ 09-06 14:30 · 7d 47% ↻ 09-10 09:00 · 重置卡 2次
 ◆ 额度[Key] 请求 90% · Token 40%
 ◆ 额度[Key] ¥108.42
 ```
@@ -39,6 +39,7 @@ pi remove git:github.com/13075061852/pi-model-quota
 ## 功能
 
 - **跟随模型切换**：自动识别订阅、OAuth 和 API Key 认证。
+- **OpenAI 账户显示**：Codex OAuth/订阅额度前展示当前邮箱和会员等级，例如 `demo@example.com PLUS`，详情也可通过 `/quota` 查看。
 - **分别显示重置时间**：5 小时和周额度各自附带本地日期与时间。
 - **重置卡**：显示 Codex 可用次数，支持用户确认后使用一张已有重置卡。
 - **过渡动画**：重置成功并取得新额度后，用约 1 秒的百分比渐变更新页脚。
@@ -77,7 +78,7 @@ pi remove git:github.com/13075061852/pi-model-quota
 
 | Provider | 认证 | 显示内容 |
 | --- | --- | --- |
-| `openai-codex` | OAuth / ChatGPT 订阅 | 5h、7d 等窗口、Credits、可用重置卡 |
+| `openai-codex` | OAuth / ChatGPT 订阅 | 邮箱、会员等级、5h、7d 等窗口、Credits、可用重置卡 |
 | `anthropic` | OAuth / Claude 订阅 | 5h、7d、模型专属窗口及额外用量预算 |
 | `openrouter` | API Key / OAuth Key | Key 预算或接口返回的剩余金额 |
 | `kimi-coding` | API Key / OAuth | Coding Plan 用量窗口 |
@@ -107,6 +108,8 @@ pi remove git:github.com/13075061852/pi-model-quota
 
 - 页脚优先显示最多两个有百分比的窗口，否则显示最多两个余额/数量；完整信息见 `/quota`。
 - 重置时间使用本地时区；未返回或已过期的时间不显示。
+- OpenAI 邮箱来自当前登录令牌的 profile/email 字段；会员等级优先取额度接口的 `plan_type`，缺失时取令牌的 `chatgpt_plan_type`，以大写显示（如 PLUS、PRO、TEAM）。未提供的字段直接省略，不根据额度推断会员等级。
+- 账户信息随额度刷新；同一提供商换号后可执行 `/quota refresh`，刷新检测到凭据变化即清除旧账户缓存。窄终端可能截断页脚，完整信息见 `/quota`。
 - 订阅额度、账户余额与 RPM/TPM 限流是不同指标；部分额度由整个账号共享，并非模型独占。
 - 瞬时查询失败会保留上次成功数据。查看 `/quota` 的更新时间和 `/quota debug` 的错误，不要将缓存视作实时保证。
 - 上游没有可用字段时显示“上游未公开”；首次请求前可能显示“等待首次请求”。
@@ -116,7 +119,8 @@ pi remove git:github.com/13075061852/pi-model-quota
 - 凭据由 Pi 的认证注册表读取，不需要在插件中额外配置 Key。
 - 账户接口地址内置并拒绝重定向；自定义认证来源不会被用于向官方接口发送重置请求。
 - 重置 POST 要求明确匹配官方来源，并在确认后重新核验凭据。
-- 不持久化额度、token、提示词或模型响应；不会注册供模型调用的重置工具。
+- 不持久化额度、邮箱、token、提示词或模型响应；不会注册供模型调用的重置工具。
+- 账户显示复用现有额度查询，不增加个人资料接口请求。邮箱会明文出现在页脚和 `/quota` 提示中，分享截图或录屏前请脱敏。
 - 查询代理支持取决于 Node 的 `http.setGlobalProxyFromEnv` 是否可用；旧运行时不保证环境代理生效。若使用代理，建议使用提供该 API 的新版 Node。
 - 网络查询临时设置进程级代理并在结束后恢复。与其他网络扩展共用进程时仍需注意代理兼容性。
 
